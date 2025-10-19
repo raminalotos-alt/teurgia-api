@@ -14,13 +14,18 @@ const isAllowedUrl = (u) => {
   } catch { return false; }
 };
 
-// CORS для OpenAI Actions
+// CORS для OpenAI
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, OpenAI-Beta");
   if (req.method === "OPTIONS") return res.status(200).end();
   next();
+});
+
+// Быстрый пинг, чтобы “будить” инстанс
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
 });
 
 // POST /query  { query: string, limit?: number }
@@ -29,18 +34,26 @@ app.post("/query", async (req, res) => {
   const limit = Math.max(1, Math.min(50, Number(req.body?.limit ?? 10)));
   if (!q) return res.status(400).json({ error: "bad_request", detail: "field 'query' is required" });
 
+  // Жёсткий таймаут 8 сек, чтобы не рвать Action
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 8000);
+
   try {
     const r = await fetch(BASE + ALLOW_PREFIX, {
+      signal: ac.signal,
       headers: {
         "User-Agent": "Mozilla/5.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru,en;q=0.9"
       }
     });
-    if (!r.ok) return res.status(502).json({ error: "upstream_error", detail: `GET ${ALLOW_PREFIX} → ${r.status}` });
+    clearTimeout(t);
+
+    if (!r.ok) {
+      return res.status(502).json({ error: "upstream_error", detail: `GET ${ALLOW_PREFIX} → ${r.status}` });
+    }
     const html = await r.text();
 
-    // простой парсер ссылок
     const linkRe = /<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
     const results = []; const seen = new Set();
     while (true) {
@@ -56,10 +69,15 @@ app.post("/query", async (req, res) => {
     if (results.length === 0) results.push({ title: "Иудейская Каббала — раздел", url: BASE + ALLOW_PREFIX });
     res.json({ result: results });
   } catch (e) {
-    res.status(502).json({ error: "upstream_error", detail: e.message });
+    clearTimeout(t);
+    const timeout = e?.name === "AbortError";
+    // Отдаём быстрый 502, чтобы Action не “обрывался”
+    return res.status(502).json({
+      error: timeout ? "timeout" : "upstream_error",
+      detail: timeout ? "teurgia.org timed out (>8s)" : String(e)
+    });
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Running on ${port}`));
-
